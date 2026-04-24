@@ -128,10 +128,18 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Models and data
-models/*
-data/*
-runs/*
+# Local datasets, checkpoints, exports, and experiment artifacts
+models/
+data/
+outputs/
+pretrained/
+tensor_memory/
+runs/
+work_dirs/
+wandb/
+*.pth
+*.pt
+/cmd.sh
 
 # torch hipify generated files
 *_hip.*

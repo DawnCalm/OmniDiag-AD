@@ -1,0 +1,18 @@
+max_epochs: 1
+
+model:
+  fuser:
+    type: ConvFuser
+    in_channels: [80, 256]
+    out_channels: 256
+
+data:
+  samples_per_gpu: 1
+  workers_per_gpu: 1
+  train:
+    dataset:
+      ann_file: ${dataset_root + "nuscenes_infos_train.pkl"}
+  val:
+    ann_file: ${dataset_root + "nuscenes_infos_val.pkl"}
+  test:
+    ann_file: ${dataset_root + "nuscenes_infos_val.pkl"}

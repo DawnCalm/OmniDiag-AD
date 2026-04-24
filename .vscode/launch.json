@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug BEVFusion Test",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/tools/test.py",
+            "args": [
+                "configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml",
+                "pretrained/bevfusion-det.pth",
+                "--eval",
+                "bbox"
+            ],
+            "env": {
+                "MASTER_HOST": "127.0.0.1:29500",
+                "MASTER_PORT": "29500",
+                "RANK": "0",
+                "WORLD_SIZE": "1",
+                "LOCAL_RANK": "0"
+            },
+            "justMyCode": false
+        }
+    ]
+}

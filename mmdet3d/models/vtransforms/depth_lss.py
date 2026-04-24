@@ -23,6 +23,11 @@ class DepthLSSTransform(BaseDepthTransform):
         ybound: Tuple[float, float, float],
         zbound: Tuple[float, float, float],
         dbound: Tuple[float, float, float],
+        use_points: str = "lidar",
+        depth_input: str = "scalar",
+        height_expand: bool = True,
+        add_depth_features: bool = False,
+        point_feature_channels: int = 5,
         downsample: int = 1,
     ) -> None:
         super().__init__(
@@ -34,9 +39,17 @@ class DepthLSSTransform(BaseDepthTransform):
             ybound=ybound,
             zbound=zbound,
             dbound=dbound,
+            use_points=use_points,
+            depth_input=depth_input,
+            height_expand=height_expand,
+            add_depth_features=add_depth_features,
         )
+        dtransform_in_channels = 1 if self.depth_input == "scalar" else self.D
+        if self.add_depth_features:
+            dtransform_in_channels += point_feature_channels
+
         self.dtransform = nn.Sequential(
-            nn.Conv2d(1, 8, 1),
+            nn.Conv2d(dtransform_in_channels, 8, 1),
             nn.BatchNorm2d(8),
             nn.ReLU(True),
             nn.Conv2d(8, 32, 5, stride=4, padding=2),
@@ -79,7 +92,7 @@ class DepthLSSTransform(BaseDepthTransform):
             self.downsample = nn.Identity()
 
     @force_fp32()
-    def get_cam_feats(self, x, d):
+    def get_cam_feats(self, x, d, mats_dict=None):
         B, N, C, fH, fW = x.shape
 
         d = d.view(B * N, *d.shape[2:])

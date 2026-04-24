@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict
 
 import torch
@@ -94,13 +95,86 @@ class BEVFusion(Base3DFusionModel):
 
         # If the camera's vtransform is a BEVDepth version, then we're using depth loss. 
         self.use_depth_loss = ((encoders.get('camera', {}) or {}).get('vtransform', {}) or {}).get('type', '') in ['BEVDepth', 'AwareBEVDepth', 'DBEVDepth', 'AwareDBEVDepth']
-
+        self.feature_export_cfg = None
 
         self.init_weights()
 
     def init_weights(self) -> None:
         if "camera" in self.encoders:
             self.encoders["camera"]["backbone"].init_weights()
+
+    def _save_debug_tensor(self, tensor, path) -> None:
+        torch.save(tensor.detach().cpu(), path)
+
+    def _get_tensor_memory_dir(self) -> str:
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+        return os.path.join(repo_root, "tensor_memory")
+
+    def configure_feature_export(
+        self,
+        output_dir: str,
+        split: str = "val",
+        save_dtype: str = "float16",
+    ) -> None:
+        self.feature_export_cfg = {
+            "output_dir": output_dir,
+            "split": split,
+            "save_dtype": save_dtype,
+        }
+
+    def disable_feature_export(self) -> None:
+        self.feature_export_cfg = None
+
+    def _should_export_features(self) -> bool:
+        return (not self.training) and self.feature_export_cfg is not None
+
+    def _build_export_basename(self, meta: Dict[str, Any], batch_idx: int) -> str:
+        sample_token = meta.get("token") or meta.get("sample_idx") or f"sample_{batch_idx:06d}"
+        sanitized = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(sample_token)
+        )
+        split = self.feature_export_cfg.get("split", "val")
+        return os.path.join(self.feature_export_cfg["output_dir"], split, sanitized)
+
+    def _cast_export_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        save_dtype = self.feature_export_cfg.get("save_dtype", "float16")
+        tensor = tensor.detach().cpu()
+        if save_dtype == "float32":
+            return tensor.float()
+        if save_dtype == "float16":
+            return tensor.half()
+        return tensor
+
+    def _export_tensor(self, tensor: torch.Tensor, path: str) -> str:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(self._cast_export_tensor(tensor), path)
+        return path
+
+    def _export_bev_features(
+        self,
+        feature_by_sensor: Dict[str, torch.Tensor],
+        fused_feature: torch.Tensor,
+        metas,
+    ):
+        export_records = []
+        for batch_idx, meta in enumerate(metas):
+            base = self._build_export_basename(meta, batch_idx)
+            feature_paths = {}
+            for sensor_name, feature in feature_by_sensor.items():
+                feature_paths[f"{sensor_name}_bev_path"] = self._export_tensor(
+                    feature[batch_idx],
+                    f"{base}_{sensor_name}_bev.pt",
+                )
+            feature_paths["fused_bev_path"] = self._export_tensor(
+                fused_feature[batch_idx],
+                f"{base}_fused_bev.pt",
+            )
+            feature_paths["sample_token"] = meta.get("token", meta.get("sample_idx"))
+            feature_paths["image_paths"] = meta.get("filename", [])
+            export_records.append(feature_paths)
+        return export_records
 
     def extract_camera_features(
         self,
@@ -293,6 +367,7 @@ class BEVFusion(Base3DFusionModel):
         **kwargs,
     ):
         features = []
+        feature_by_sensor = {}
         auxiliary_losses = {}
         for sensor in (
             self.encoders if self.training else list(self.encoders.keys())[::-1]
@@ -323,6 +398,7 @@ class BEVFusion(Base3DFusionModel):
                 raise ValueError(f"unsupported sensor: {sensor}")
 
             features.append(feature)
+            feature_by_sensor[sensor] = feature
 
         if not self.training:
             # avoid OOM
@@ -333,6 +409,10 @@ class BEVFusion(Base3DFusionModel):
         else:
             assert len(features) == 1, features
             x = features[0]
+
+        export_records = None
+        if self._should_export_features():
+            export_records = self._export_bev_features(feature_by_sensor, x, metas)
 
         batch_size = x.shape[0]
 
@@ -366,6 +446,9 @@ class BEVFusion(Base3DFusionModel):
                 if type == "object":
                     pred_dict = head(x, metas)
                     bboxes = head.get_bboxes(pred_dict, metas)
+                    uncertainty = None
+                    if len(pred_dict) > 0 and len(pred_dict[0]) > 0:
+                        uncertainty = pred_dict[0][0].get("query_uncertainty")
                     for k, (boxes, scores, labels) in enumerate(bboxes):
                         outputs[k].update(
                             {
@@ -374,6 +457,10 @@ class BEVFusion(Base3DFusionModel):
                                 "labels_3d": labels.cpu(),
                             }
                         )
+                        if uncertainty is not None:
+                            outputs[k]["uncertainty_3d"] = uncertainty[
+                                k, ..., -head.num_proposals :
+                            ].reshape(-1).cpu()
                 elif type == "map":
                     logits = head(x)
                     for k in range(batch_size):
@@ -385,5 +472,8 @@ class BEVFusion(Base3DFusionModel):
                         )
                 else:
                     raise ValueError(f"unsupported head: {type}")
+            if export_records is not None:
+                for k in range(batch_size):
+                    outputs[k]["bev_feature_paths"] = export_records[k]
             return outputs
 
