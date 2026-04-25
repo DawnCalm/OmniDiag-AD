@@ -9,6 +9,7 @@ from mmcv.parallel import MMDataParallel
 from mmcv.runner import load_checkpoint, wrap_fp16_model
 from torchpack.utils.config import configs
 
+from bev_vlm.visualization import save_feature_render
 from mmdet3d.datasets import build_dataloader, build_dataset
 from mmdet3d.models import build_model
 from mmdet3d.utils import recursive_eval
@@ -49,6 +50,11 @@ def parse_args():
         action=DictAction,
         help="override config options",
     )
+    parser.add_argument(
+        "--skip-renders",
+        action="store_true",
+        help="skip saving BEV/EDL rendered png files",
+    )
     return parser.parse_args()
 
 
@@ -76,6 +82,26 @@ def iter_meta_list(batch_metas):
     return metas
 
 
+def sanitize_sample_token(sample_token):
+    return "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(sample_token)
+    )
+
+
+def cast_tensor_for_save(tensor, save_dtype):
+    tensor = tensor.detach().cpu()
+    if save_dtype == "float16":
+        return tensor.half()
+    return tensor.float()
+
+
+def write_tensor(path, tensor, save_dtype):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(cast_tensor_for_save(tensor, save_dtype), str(path))
+    return str(path.resolve())
+
+
 def json_ready_prediction(result, class_names):
     boxes = result["boxes_3d"].tensor.cpu().tolist()
     scores = result["scores_3d"].cpu().tolist()
@@ -100,7 +126,12 @@ def json_ready_prediction(result, class_names):
             obj["uncertainty"] = float(uncertainties[idx])
         objects.append(obj)
 
-    return {"num_objects": len(objects), "objects": objects}
+    payload = {"num_objects": len(objects), "objects": objects}
+    if "edl_uncertainty_map" in result:
+        scene_uncertainty = float(result["edl_uncertainty_map"].float().mean().item())
+        payload["scene_uncertainty"] = scene_uncertainty
+        payload["scene_confidence"] = float(max(0.0, min(1.0, 1.0 - scene_uncertainty)))
+    return payload
 
 
 def write_json(path, payload):
@@ -163,39 +194,78 @@ def main():
             metas = iter_meta_list(batch["metas"])
             for result, meta in zip(results, metas):
                 sample_token = str(meta.get("token") or meta.get("sample_idx"))
-                sanitized = "".join(
-                    ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in sample_token
-                )
+                sanitized = sanitize_sample_token(sample_token)
                 pred_path = split_dir / f"{sanitized}_pred.json"
                 prediction_payload = json_ready_prediction(result, dataset.CLASSES)
                 write_json(pred_path, prediction_payload)
 
                 feature_paths = result.get("bev_feature_paths", {})
+                camera_bev_path = feature_paths.get("camera_bev_path")
+                lidar_bev_path = feature_paths.get("lidar_bev_path")
+                fused_bev_path = feature_paths.get("fused_bev_path")
+
+                camera_bev_render_path = None
+                lidar_bev_render_path = None
+                fused_bev_render_path = None
+                if not args.skip_renders:
+                    if camera_bev_path:
+                        camera_bev_render_path = save_feature_render(
+                            camera_bev_path,
+                            split_dir / f"{sanitized}_camera_bev.png",
+                        )
+                    if lidar_bev_path:
+                        lidar_bev_render_path = save_feature_render(
+                            lidar_bev_path,
+                            split_dir / f"{sanitized}_lidar_bev.png",
+                        )
+                    if fused_bev_path:
+                        fused_bev_render_path = save_feature_render(
+                            fused_bev_path,
+                            split_dir / f"{sanitized}_fused_bev.png",
+                        )
+
+                edl_evidence_path = None
+                edl_render_path = None
+                if "edl_evidence_map" in result:
+                    edl_evidence_path = write_tensor(
+                        split_dir / f"{sanitized}_edl_evidence.pt",
+                        result["edl_evidence_map"],
+                        args.save_dtype,
+                    )
+                if not args.skip_renders:
+                    if "edl_uncertainty_map" in result:
+                        edl_render_path = save_feature_render(
+                            result["edl_uncertainty_map"],
+                            split_dir / f"{sanitized}_edl_uncertainty.png",
+                        )
+                    elif "edl_evidence_map" in result:
+                        edl_render_path = save_feature_render(
+                            result["edl_evidence_map"],
+                            split_dir / f"{sanitized}_edl_evidence.png",
+                        )
+
                 row = {
                     "id": sample_token,
                     "sample_token": sample_token,
                     "split": args.split,
                     "image_paths": feature_paths.get("image_paths", meta.get("filename", [])),
-                    "camera_bev_path": (
-                        str(Path(feature_paths["camera_bev_path"]).resolve())
-                        if feature_paths.get("camera_bev_path")
-                        else None
-                    ),
-                    "lidar_bev_path": (
-                        str(Path(feature_paths["lidar_bev_path"]).resolve())
-                        if feature_paths.get("lidar_bev_path")
-                        else None
-                    ),
-                    "fused_bev_path": (
-                        str(Path(feature_paths["fused_bev_path"]).resolve())
-                        if feature_paths.get("fused_bev_path")
-                        else None
-                    ),
+                    "camera_bev_path": str(Path(camera_bev_path).resolve()) if camera_bev_path else None,
+                    "lidar_bev_path": str(Path(lidar_bev_path).resolve()) if lidar_bev_path else None,
+                    "fused_bev_path": str(Path(fused_bev_path).resolve()) if fused_bev_path else None,
+                    "camera_bev_render_path": camera_bev_render_path,
+                    "lidar_bev_render_path": lidar_bev_render_path,
+                    "fused_bev_render_path": fused_bev_render_path,
                     "pred_path": str(pred_path.resolve()),
                     "gt_ref": {
                         "ann_file": str(Path(dataset.ann_file).resolve()),
                         "sample_token": sample_token,
                     },
+                    "anchor_type": None,
+                    "anchor_object": None,
+                    "anchor_crop_path": None,
+                    "anchor_crop_meta": None,
+                    "edl_evidence_path": edl_evidence_path,
+                    "edl_render_path": edl_render_path,
                     "metadata": {
                         "timestamp": meta.get("timestamp"),
                         "lidar_path": meta.get("lidar_path"),

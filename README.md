@@ -18,3 +18,54 @@ While traditional 3D detection models (like BEVFusion) act as "black boxes", our
     2.  *Perception Attribution*: Why did a detection fail? (e.g., "Camera missed the object due to backlighting, but LiDAR captured the reflection").
     3.  *Trustworthiness Assessment*: Uncertainty evaluation powered by Evidential Deep Learning (EDL).
 * **🚀 Three-Stage Training Pipeline**: Structured training including BEVFusion+EDL pre-training, Connector alignment, and QLoRA instruction fine-tuning to prevent catastrophic forgetting.
+
+---
+
+## 🧭 Workflow
+
+### Local conservative path (`4GB VRAM`)
+
+1. Export BEV features, predictions, renders, and EDL maps:
+
+```bash
+python tools/export_bev_features.py \
+  configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser_mini.yaml \
+  ./pretrained/bevfusion-det.pth \
+  --output-dir outputs/bev_vlm \
+  --split val \
+  --max-samples 8
+```
+
+2. Build ShareGPT samples, flat `jsonl`, and an enriched manifest with missed-GT anchors:
+
+```bash
+python tools/create_bev_vlm_data.py \
+  outputs/bev_vlm/manifest_val.jsonl \
+  --output outputs/bev_vlm/bev_vlm_sharegpt.json
+```
+
+3. Train the local Stage 2 prototype with the lightweight MLP connector:
+
+```bash
+python tools/train_bev_vlm_stage2.py \
+  outputs/bev_vlm/bev_vlm_sharegpt_flat.jsonl \
+  --output-dir outputs/bev_vlm/stage2_local \
+  --epochs 3 \
+  --batch-size 2
+```
+
+4. Run lightweight evaluation and visualization:
+
+```bash
+python tools/eval_bev_vlm.py predictions.jsonl outputs/bev_vlm/bev_vlm_sharegpt_flat.jsonl
+python tools/visualize_bev_vlm_sample.py outputs/bev_vlm/bev_vlm_sharegpt.json --output outputs/bev_vlm/sample_panel.png
+```
+
+### Server enhancement path
+
+Use the same flat dataset and enriched manifest, then switch to the server-stage scripts:
+
+- `tools/train_bev_vlm_stage2_server.py`
+- `tools/train_bev_vlm_stage3_server.py`
+
+These scripts are designed for a server environment with `transformers`, `peft`, and optionally `bitsandbytes` installed.

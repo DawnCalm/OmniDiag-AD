@@ -67,6 +67,10 @@ class TransFusionHead(nn.Module):
         train_cfg=None,
         test_cfg=None,
         bbox_coder=None,
+        use_edl=True,
+        edl_activation="softplus",
+        edl_loss_weight=0.25,
+        edl_eps=1e-6,
     ):
         super(TransFusionHead, self).__init__()
 
@@ -82,6 +86,10 @@ class TransFusionHead(nn.Module):
         self.nms_kernel_size = nms_kernel_size
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
+        self.use_edl = use_edl
+        self.edl_activation = edl_activation
+        self.edl_loss_weight = edl_loss_weight
+        self.edl_eps = edl_eps
 
         self.use_sigmoid_cls = loss_cls.get("use_sigmoid", False)
         if not self.use_sigmoid_cls:
@@ -170,6 +178,16 @@ class TransFusionHead(nn.Module):
         self.img_feat_pos = None
         self.img_feat_collapsed_pos = None
 
+    def logits_to_evidence(self, logits):
+        if self.edl_activation == "relu":
+            return F.relu(logits)
+        return F.softplus(logits)
+
+    def evidence_to_uncertainty(self, evidence):
+        alpha = evidence + 1.0
+        strength = torch.clamp(alpha.sum(dim=1, keepdim=True), min=self.edl_eps)
+        return self.num_classes / strength
+
     def create_2D_grid(self, x_size, y_size):
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
         # NOTE: modified
@@ -235,6 +253,11 @@ class TransFusionHead(nn.Module):
         # image guided query initialization
         #################################
         dense_heatmap = self.heatmap_head(lidar_feat)
+        dense_evidence = None
+        dense_uncertainty = None
+        if self.use_edl:
+            dense_evidence = self.logits_to_evidence(dense_heatmap)
+            dense_uncertainty = self.evidence_to_uncertainty(dense_evidence)
         dense_heatmap_img = None
         heatmap = dense_heatmap.detach().sigmoid()
         padding = self.nms_kernel_size // 2
@@ -310,6 +333,12 @@ class TransFusionHead(nn.Module):
             # Prediction
             res_layer = self.prediction_heads[i](query_feat)
             res_layer["center"] = res_layer["center"] + query_pos.permute(0, 2, 1)
+            if self.use_edl and "heatmap" in res_layer:
+                query_evidence = self.logits_to_evidence(res_layer["heatmap"])
+                res_layer["query_evidence"] = query_evidence
+                res_layer["query_uncertainty"] = self.evidence_to_uncertainty(
+                    query_evidence
+                )
             first_res_layer = res_layer
             ret_dicts.append(res_layer)
 
@@ -324,6 +353,10 @@ class TransFusionHead(nn.Module):
             dim=-1,
         )  # [bs, num_classes, num_proposals]
         ret_dicts[0]["dense_heatmap"] = dense_heatmap
+        if dense_evidence is not None:
+            ret_dicts[0]["dense_evidence"] = dense_evidence
+        if dense_uncertainty is not None:
+            ret_dicts[0]["dense_uncertainty"] = dense_uncertainty
 
         if self.auxiliary is False:
             # only return the results of last decoder layer
@@ -332,7 +365,13 @@ class TransFusionHead(nn.Module):
         # return all the layer's results for auxiliary superivison
         new_res = {}
         for key in ret_dicts[0].keys():
-            if key not in ["dense_heatmap", "dense_heatmap_old", "query_heatmap_score"]:
+            if key not in [
+                "dense_heatmap",
+                "dense_heatmap_old",
+                "query_heatmap_score",
+                "dense_evidence",
+                "dense_uncertainty",
+            ]:
                 new_res[key] = torch.cat(
                     [ret_dict[key] for ret_dict in ret_dicts], dim=-1
                 )
@@ -706,6 +745,31 @@ class TransFusionHead(nn.Module):
 
             loss_dict[f"{prefix}_loss_cls"] = layer_loss_cls
             loss_dict[f"{prefix}_loss_bbox"] = layer_loss_bbox
+            if (
+                self.use_edl
+                and self.edl_loss_weight > 0
+                and "query_uncertainty" in preds_dict
+            ):
+                layer_uncertainty = preds_dict["query_uncertainty"][
+                    ...,
+                    idx_layer * self.num_proposals : (idx_layer + 1) * self.num_proposals,
+                ].reshape(-1)
+                valid_mask = layer_label_weights > 0
+                if valid_mask.any():
+                    confidence_target = (layer_labels < self.num_classes).float()
+                    layer_confidence = 1.0 - layer_uncertainty.clamp(
+                        min=0.0, max=1.0
+                    )
+                    edl_weight = layer_label_weights[valid_mask].float()
+                    layer_loss_edl = F.binary_cross_entropy(
+                        layer_confidence[valid_mask],
+                        confidence_target[valid_mask],
+                        weight=edl_weight,
+                        reduction="sum",
+                    ) / torch.clamp(edl_weight.sum(), min=1.0)
+                else:
+                    layer_loss_edl = layer_loss_cls.new_tensor(0.0)
+                loss_dict[f"{prefix}_loss_edl"] = layer_loss_edl * self.edl_loss_weight
             # loss_dict[f'{prefix}_loss_iou'] = layer_loss_iou
 
         loss_dict[f"matched_ious"] = layer_loss_cls.new_tensor(matched_ious)
@@ -783,6 +847,11 @@ class TransFusionHead(nn.Module):
                 boxes3d = temp[i]["bboxes"]
                 scores = temp[i]["scores"]
                 labels = temp[i]["labels"]
+                uncertainty = None
+                if "query_uncertainty" in preds_dict[0]:
+                    uncertainty = preds_dict[0]["query_uncertainty"][
+                        i, 0, -self.num_proposals :
+                    ]
                 ## adopt circle nms for different categories
                 if self.test_cfg["nms_type"] != None:
                     keep_mask = torch.zeros_like(scores)
@@ -833,19 +902,25 @@ class TransFusionHead(nn.Module):
                         scores=scores[keep_mask],
                         labels=labels[keep_mask],
                     )
+                    if uncertainty is not None:
+                        ret["uncertainty"] = uncertainty[keep_mask]
                 else:  # no nms
                     ret = dict(bboxes=boxes3d, scores=scores, labels=labels)
+                    if uncertainty is not None:
+                        ret["uncertainty"] = uncertainty
                 ret_layer.append(ret)
             rets.append(ret_layer)
         assert len(rets) == 1
         assert len(rets[0]) == 1
-        res = [
-            [
-                metas[0]["box_type_3d"](
-                    rets[0][0]["bboxes"], box_dim=rets[0][0]["bboxes"].shape[-1]
-                ),
-                rets[0][0]["scores"],
-                rets[0][0]["labels"].int(),
-            ]
+        sample = rets[0][0]
+        res_sample = [
+            metas[0]["box_type_3d"](
+                sample["bboxes"], box_dim=sample["bboxes"].shape[-1]
+            ),
+            sample["scores"],
+            sample["labels"].int(),
         ]
+        if "uncertainty" in sample:
+            res_sample.append(sample["uncertainty"])
+        res = [res_sample]
         return res

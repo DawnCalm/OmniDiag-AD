@@ -446,10 +446,13 @@ class BEVFusion(Base3DFusionModel):
                 if type == "object":
                     pred_dict = head(x, metas)
                     bboxes = head.get_bboxes(pred_dict, metas)
-                    uncertainty = None
+                    dense_evidence = None
+                    dense_uncertainty = None
                     if len(pred_dict) > 0 and len(pred_dict[0]) > 0:
-                        uncertainty = pred_dict[0][0].get("query_uncertainty")
-                    for k, (boxes, scores, labels) in enumerate(bboxes):
+                        dense_evidence = pred_dict[0][0].get("dense_evidence")
+                        dense_uncertainty = pred_dict[0][0].get("dense_uncertainty")
+                    for k, sample in enumerate(bboxes):
+                        boxes, scores, labels = sample[:3]
                         outputs[k].update(
                             {
                                 "boxes_3d": boxes.to("cpu"),
@@ -457,10 +460,12 @@ class BEVFusion(Base3DFusionModel):
                                 "labels_3d": labels.cpu(),
                             }
                         )
-                        if uncertainty is not None:
-                            outputs[k]["uncertainty_3d"] = uncertainty[
-                                k, ..., -head.num_proposals :
-                            ].reshape(-1).cpu()
+                        if len(sample) > 3 and sample[3] is not None:
+                            outputs[k]["uncertainty_3d"] = sample[3].reshape(-1).cpu()
+                        if dense_evidence is not None:
+                            outputs[k]["edl_evidence_map"] = dense_evidence[k].cpu()
+                        if dense_uncertainty is not None:
+                            outputs[k]["edl_uncertainty_map"] = dense_uncertainty[k].cpu()
                 elif type == "map":
                     logits = head(x)
                     for k in range(batch_size):
