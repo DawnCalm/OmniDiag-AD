@@ -16,6 +16,7 @@ from bev_vlm.data import (
     load_records,
     save_json,
     split_records,
+    task_type_to_id,
 )
 from bev_vlm.local_stage2 import LocalBEVQAStage2Model
 from bev_vlm.tokenizer import SimpleCharTokenizer
@@ -132,6 +133,7 @@ def main():
         vocab_size=tokenizer.vocab_size,
         pad_id=tokenizer.pad_id,
         hidden_size=args.hidden_size,
+        num_tasks=max(task_type_to_id(record["task_type"]) for record in records) + 1,
         connector_token_grid=tuple(args.token_grid),
     ).to(args.device)
     optimizer = AdamW(

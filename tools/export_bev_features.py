@@ -127,10 +127,46 @@ def json_ready_prediction(result, class_names):
         objects.append(obj)
 
     payload = {"num_objects": len(objects), "objects": objects}
-    if "edl_uncertainty_map" in result:
-        scene_uncertainty = float(result["edl_uncertainty_map"].float().mean().item())
+    object_uncertainties = [
+        obj for obj in objects if obj.get("uncertainty") is not None
+    ]
+    if object_uncertainties:
+        ranked_objects = sorted(
+            object_uncertainties,
+            key=lambda obj: float(obj.get("score", 0.0)),
+            reverse=True,
+        )[:5] # top-5
+        weights = [max(float(obj.get("score", 0.0)), 1e-3) for obj in ranked_objects]
+        total_weight = sum(weights)
+        if total_weight > 0:
+            scene_uncertainty = sum(
+                float(obj["uncertainty"]) * weight
+                for obj, weight in zip(ranked_objects, weights)
+            ) / total_weight
+        else:
+            scene_uncertainty = sum(
+                float(obj["uncertainty"]) for obj in ranked_objects
+            ) / max(len(ranked_objects), 1)
+        scene_uncertainty = float(max(0.0, min(1.0, scene_uncertainty)))
         payload["scene_uncertainty"] = scene_uncertainty
-        payload["scene_confidence"] = float(max(0.0, min(1.0, 1.0 - scene_uncertainty)))
+        payload["scene_confidence"] = float(
+            max(0.0, min(1.0, 1.0 - scene_uncertainty))
+        )
+        payload["scene_uncertainty_source"] = "object_weighted_topk"
+    if "edl_uncertainty_map" in result:
+        dense_scene_uncertainty = float(
+            result["edl_uncertainty_map"].float().mean().item()
+        )
+        payload["scene_uncertainty_dense"] = dense_scene_uncertainty
+        payload["scene_confidence_dense"] = float(
+            max(0.0, min(1.0, 1.0 - dense_scene_uncertainty))
+        )
+        if "scene_uncertainty" not in payload:
+            payload["scene_uncertainty"] = dense_scene_uncertainty
+            payload["scene_confidence"] = float(
+                max(0.0, min(1.0, 1.0 - dense_scene_uncertainty))
+            )
+            payload["scene_uncertainty_source"] = "dense_map_fallback"
     return payload
 
 

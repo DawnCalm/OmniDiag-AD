@@ -188,6 +188,14 @@ class TransFusionHead(nn.Module):
         strength = torch.clamp(alpha.sum(dim=1, keepdim=True), min=self.edl_eps)
         return self.num_classes / strength
 
+    def evidence_to_selected_class_uncertainty(self, evidence, class_indices):
+        alpha = evidence + 1.0
+        strength = torch.clamp(alpha.sum(dim=1), min=self.edl_eps)
+        selected_alpha = torch.gather(alpha, 1, class_indices.unsqueeze(1)).squeeze(1)
+        selected_confidence = selected_alpha / strength
+        selected_uncertainty = 1.0 - selected_confidence
+        return selected_uncertainty.unsqueeze(1), selected_confidence.unsqueeze(1)
+
     def create_2D_grid(self, x_size, y_size):
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
         # NOTE: modified
@@ -335,10 +343,13 @@ class TransFusionHead(nn.Module):
             res_layer["center"] = res_layer["center"] + query_pos.permute(0, 2, 1)
             if self.use_edl and "heatmap" in res_layer:
                 query_evidence = self.logits_to_evidence(res_layer["heatmap"])
-                res_layer["query_evidence"] = query_evidence
-                res_layer["query_uncertainty"] = self.evidence_to_uncertainty(
-                    query_evidence
+                query_uncertainty, query_confidence = self.evidence_to_selected_class_uncertainty(
+                    query_evidence,
+                    top_proposals_class,
                 )
+                res_layer["query_evidence"] = query_evidence
+                res_layer["query_uncertainty"] = query_uncertainty
+                res_layer["query_confidence"] = query_confidence
             first_res_layer = res_layer
             ret_dicts.append(res_layer)
 

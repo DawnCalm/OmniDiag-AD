@@ -8,8 +8,10 @@ from torch.utils.data import Dataset
 
 TASK_TO_ID = {
     "scene": 0,
-    "attribution": 1,
-    "trust": 2,
+    "miss_summary": 1,
+    "attribution": 2,
+    "attribution_object": 2,
+    "trust": 3,
 }
 
 

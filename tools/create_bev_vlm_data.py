@@ -10,6 +10,15 @@ import torch
 
 from bev_vlm.data import save_json, save_jsonl
 
+CAMERA_YAW_DEGREES = {
+    "CAM_FRONT": 0.0,
+    "CAM_FRONT_LEFT": 60.0,
+    "CAM_BACK_LEFT": 120.0,
+    "CAM_BACK": 180.0,
+    "CAM_BACK_RIGHT": -120.0,
+    "CAM_FRONT_RIGHT": -60.0,
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -105,14 +114,50 @@ def build_gt_lookup(manifest_rows):
     return gt_lookup
 
 
+def angle_from_xy_deg(x, y):
+    return float(np.degrees(np.arctan2(float(y), float(x))))
+
+
+def angular_distance_deg(a, b):
+    delta = (float(a) - float(b) + 180.0) % 360.0 - 180.0
+    return abs(delta)
+
+
 def direction_from_xy(x, y):
-    front = "前方" if x >= 0 else "后方"
-    if abs(y) < 2.5:
-        return front
-    lateral = "左侧" if y >= 0 else "右侧"
-    if front == "前方":
-        return f"前{lateral}"
-    return f"后{lateral}"
+    angle = angle_from_xy_deg(x, y)
+    if -22.5 <= angle < 22.5:
+        return "前方"
+    if 22.5 <= angle < 67.5:
+        return "前左侧"
+    if 67.5 <= angle < 112.5:
+        return "左侧"
+    if 112.5 <= angle < 157.5:
+        return "后左侧"
+    if angle >= 157.5 or angle < -157.5:
+        return "后方"
+    if -157.5 <= angle < -112.5:
+        return "后右侧"
+    if -112.5 <= angle < -67.5:
+        return "右侧"
+    return "前右侧"
+
+
+def rank_cameras_for_anchor(center):
+    target_angle = angle_from_xy_deg(center[0], center[1])
+    ranked = sorted(
+        CAMERA_YAW_DEGREES.items(),
+        key=lambda item: angular_distance_deg(target_angle, item[1]),
+    )
+    return [(name, angular_distance_deg(target_angle, yaw_deg)) for name, yaw_deg in ranked]
+
+
+def camera_alignment_weight(center, camera_name):
+    if camera_name not in CAMERA_YAW_DEGREES:
+        return 1.0, None
+    target_angle = angle_from_xy_deg(center[0], center[1])
+    angle_diff = angular_distance_deg(target_angle, CAMERA_YAW_DEGREES[camera_name])
+    weight = float(np.exp(-((angle_diff / 55.0) ** 2)))
+    return weight, angle_diff
 
 
 def filter_gt_objects(info):
@@ -187,7 +232,14 @@ def box_corners_from_anchor(center, size, yaw):
     return corners @ rot.T + center
 
 
-def select_anchor_camera_crop(anchor, info, crop_dir, min_crop_size, crop_padding):
+def select_anchor_camera_crop(
+    anchor,
+    info,
+    crop_dir,
+    min_crop_size,
+    crop_padding,
+    crop_name_suffix=None,
+):
     if anchor is None:
         return None
 
@@ -196,61 +248,81 @@ def select_anchor_camera_crop(anchor, info, crop_dir, min_crop_size, crop_paddin
     crop_dir = Path(crop_dir)
     crop_dir.mkdir(parents=True, exist_ok=True)
 
-    best_candidate = None
-    for camera_name, cam_info in info.get("cams", {}).items():
-        image_path = resolve_path(cam_info["data_path"])
-        image = mmcv.imread(image_path)
-        if image is None:
-            continue
-        height, width = image.shape[:2]
+    ranked_cameras = rank_cameras_for_anchor(anchor["center"])
+    preferred_camera_names = [
+        camera_name
+        for camera_name, angle_diff in ranked_cameras
+        if camera_name in info.get("cams", {}) and angle_diff <= 100.0
+    ]
 
-        center_camera = lidar_to_camera(center_lidar, cam_info)
-        if center_camera[0, 2] <= 1e-3:
-            continue
+    def find_best_candidate(camera_names):
+        best_candidate = None
+        for camera_name in camera_names:
+            cam_info = info.get("cams", {}).get(camera_name)
+            if cam_info is None:
+                continue
+            image_path = resolve_path(cam_info["data_path"])
+            image = mmcv.imread(image_path)
+            if image is None:
+                continue
+            height, width = image.shape[:2]
 
-        corners_camera = lidar_to_camera(corners_lidar, cam_info)
-        projected, valid = project_camera_points(corners_camera, cam_info["cam_intrinsic"])
-        if not valid.any():
-            continue
-        visible = projected[valid]
-        min_xy = visible.min(axis=0)
-        max_xy = visible.max(axis=0)
+            center_camera = lidar_to_camera(center_lidar, cam_info)
+            if center_camera[0, 2] <= 1e-3:
+                continue
 
-        x1 = max(0.0, float(min_xy[0]))
-        y1 = max(0.0, float(min_xy[1]))
-        x2 = min(float(width), float(max_xy[0]))
-        y2 = min(float(height), float(max_xy[1]))
-        if x2 <= x1 or y2 <= y1:
-            continue
+            corners_camera = lidar_to_camera(corners_lidar, cam_info)
+            projected, valid = project_camera_points(corners_camera, cam_info["cam_intrinsic"])
+            if not valid.any():
+                continue
+            visible = projected[valid]
+            min_xy = visible.min(axis=0)
+            max_xy = visible.max(axis=0)
 
-        box_w = x2 - x1
-        box_h = y2 - y1
-        pad_w = box_w * crop_padding
-        pad_h = box_h * crop_padding
-        side = max(min_crop_size, int(round(max(box_w + 2 * pad_w, box_h + 2 * pad_h))))
+            x1 = max(0.0, float(min_xy[0]))
+            y1 = max(0.0, float(min_xy[1]))
+            x2 = min(float(width), float(max_xy[0]))
+            y2 = min(float(height), float(max_xy[1]))
+            if x2 <= x1 or y2 <= y1:
+                continue
 
-        center_proj, center_valid = project_camera_points(center_camera, cam_info["cam_intrinsic"])
-        if not center_valid[0]:
-            continue
-        cx, cy = center_proj[0]
-        crop_x1 = int(round(max(0.0, cx - side / 2)))
-        crop_y1 = int(round(max(0.0, cy - side / 2)))
-        crop_x2 = int(round(min(float(width), crop_x1 + side)))
-        crop_y2 = int(round(min(float(height), crop_y1 + side)))
-        crop_x1 = max(0, crop_x2 - side)
-        crop_y1 = max(0, crop_y2 - side)
-        if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
-            continue
+            box_w = x2 - x1
+            box_h = y2 - y1
+            pad_w = box_w * crop_padding
+            pad_h = box_h * crop_padding
+            side = max(min_crop_size, int(round(max(box_w + 2 * pad_w, box_h + 2 * pad_h))))
 
-        candidate = {
-            "camera_name": camera_name,
-            "image_path": image_path,
-            "image": image,
-            "bbox": [crop_x1, crop_y1, crop_x2, crop_y2],
-            "score": float((box_w * box_h) / max(center_camera[0, 2], 1e-3)),
-        }
-        if best_candidate is None or candidate["score"] > best_candidate["score"]:
-            best_candidate = candidate
+            center_proj, center_valid = project_camera_points(center_camera, cam_info["cam_intrinsic"])
+            if not center_valid[0]:
+                continue
+            cx, cy = center_proj[0]
+            crop_x1 = int(round(max(0.0, cx - side / 2)))
+            crop_y1 = int(round(max(0.0, cy - side / 2)))
+            crop_x2 = int(round(min(float(width), crop_x1 + side)))
+            crop_y2 = int(round(min(float(height), crop_y1 + side)))
+            crop_x1 = max(0, crop_x2 - side)
+            crop_y1 = max(0, crop_y2 - side)
+            if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+                continue
+
+            alignment_weight, angle_diff = camera_alignment_weight(anchor["center"], camera_name)
+            raw_score = float((box_w * box_h) / max(center_camera[0, 2], 1e-3))
+            candidate = {
+                "camera_name": camera_name,
+                "image_path": image_path,
+                "image": image,
+                "bbox": [crop_x1, crop_y1, crop_x2, crop_y2],
+                "score": raw_score * alignment_weight,
+                "raw_score": raw_score,
+                "camera_angle_diff_deg": angle_diff,
+            }
+            if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                best_candidate = candidate
+        return best_candidate
+
+    best_candidate = find_best_candidate(preferred_camera_names)
+    if best_candidate is None:
+        best_candidate = find_best_candidate(list(info.get("cams", {}).keys()))
 
     if best_candidate is None:
         return None
@@ -262,13 +334,15 @@ def select_anchor_camera_crop(anchor, info, crop_dir, min_crop_size, crop_paddin
 
     sample_token = info["token"]
     camera_name = best_candidate["camera_name"]
-    crop_path = crop_dir / f"{sample_token}_{camera_name}_anchor.jpg"
+    suffix = "anchor" if crop_name_suffix is None else f"{crop_name_suffix}_anchor"
+    crop_path = crop_dir / f"{sample_token}_{camera_name}_{suffix}.jpg"
     mmcv.imwrite(crop, str(crop_path))
     return {
         "camera_name": camera_name,
         "source_image_path": best_candidate["image_path"],
         "crop_path": str(crop_path.resolve()),
         "crop_box_xyxy": [int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2)],
+        "camera_angle_diff_deg": best_candidate.get("camera_angle_diff_deg"),
     }
 
 
@@ -281,9 +355,9 @@ def xy_to_grid(x, y, height, width, point_cloud_range):
     return max(0, min(width - 1, grid_x)), max(0, min(height - 1, grid_y))
 
 
-def region_feature_strength(feature_path, center, size, point_cloud_range):
+def extract_feature_patch(feature_path, center, size, point_cloud_range):
     if not feature_path:
-        return 0.0
+        return None
     tensor = torch.load(resolve_path(feature_path), map_location="cpu").float()
     if tensor.dim() != 3:
         raise ValueError(f"Expected CHW tensor in {feature_path}, got shape {tuple(tensor.shape)}")
@@ -299,8 +373,55 @@ def region_feature_strength(feature_path, center, size, point_cloud_range):
     y0, y1 = max(0, cy - y_radius), min(height, cy + y_radius + 1)
     patch = tensor[:, y0:y1, x0:x1]
     if patch.numel() == 0:
+        return None
+    return patch
+
+
+def region_feature_strength(feature_path, center, size, point_cloud_range):
+    patch = extract_feature_patch(feature_path, center, size, point_cloud_range)
+    if patch is None:
         return 0.0
     return float(patch.abs().mean().item())
+
+
+def region_feature_stats(feature_path, center, size, point_cloud_range):
+    patch = extract_feature_patch(feature_path, center, size, point_cloud_range)
+    if patch is None:
+        return {
+            "mean_abs_response": 0.0,
+            "peak_abs_response": 0.0,
+            "patch_shape": None,
+        }
+    abs_patch = patch.abs()
+    return {
+        "mean_abs_response": float(abs_patch.mean().item()),
+        "peak_abs_response": float(abs_patch.max().item()),
+        "patch_shape": [int(v) for v in patch.shape],
+    }
+
+
+def region_edl_stats(feature_path, center, size, point_cloud_range):
+    patch = extract_feature_patch(feature_path, center, size, point_cloud_range)
+    if patch is None:
+        return {
+            "local_evidence_mean": 0.0,
+            "local_evidence_peak": 0.0,
+            "local_uncertainty_mean": 1.0,
+            "local_uncertainty_min": 1.0,
+            "patch_shape": None,
+        }
+
+    evidence = patch.clamp_min(0.0)
+    num_classes = max(int(evidence.shape[0]), 1)
+    local_strength = evidence.sum(dim=0) + float(num_classes)
+    local_uncertainty = float(num_classes) / local_strength.clamp_min(1e-6)
+    return {
+        "local_evidence_mean": float(evidence.mean().item()),
+        "local_evidence_peak": float(evidence.max().item()),
+        "local_uncertainty_mean": float(local_uncertainty.mean().item()),
+        "local_uncertainty_min": float(local_uncertainty.min().item()),
+        "patch_shape": [int(v) for v in patch.shape],
+    }
 
 
 def xy_distance(a, b):
@@ -318,7 +439,46 @@ def find_nearest_prediction(anchor, pred_objects):
     return nearest
 
 
-def choose_missed_gt_anchor(gt_objects, pred_objects, match_distance_thresh):
+def summarize_anchor_local_stats(record, anchor, point_cloud_range):
+    camera_stats = region_feature_stats(
+        record.get("camera_bev_path"), anchor["center"], anchor["size"], point_cloud_range
+    )
+    lidar_stats = region_feature_stats(
+        record.get("lidar_bev_path"), anchor["center"], anchor["size"], point_cloud_range
+    )
+    fused_stats = region_feature_stats(
+        record.get("fused_bev_path"), anchor["center"], anchor["size"], point_cloud_range
+    )
+    edl_stats = region_edl_stats(
+        record.get("edl_evidence_path"), anchor["center"], anchor["size"], point_cloud_range
+    )
+
+    response_strengths = {
+        "camera": camera_stats["mean_abs_response"],
+        "lidar": lidar_stats["mean_abs_response"],
+        "fused": fused_stats["mean_abs_response"],
+    }
+    total_strength = sum(response_strengths.values())
+    if total_strength > 1e-6:
+        response_shares = {
+            name: float(value / total_strength) for name, value in response_strengths.items()
+        }
+    else:
+        response_shares = {name: 0.0 for name in response_strengths}
+
+    dominant_modality = max(response_strengths, key=response_strengths.get)
+    return {
+        "response_strengths": response_strengths,
+        "response_shares": response_shares,
+        "dominant_modality": dominant_modality,
+        "camera_stats": camera_stats,
+        "lidar_stats": lidar_stats,
+        "fused_stats": fused_stats,
+        "edl_stats": edl_stats,
+    }
+
+
+def choose_missed_gt_anchors(gt_objects, pred_objects, match_distance_thresh):
     missed = []
     for gt_obj in gt_objects:
         gt_label = normalize_label_name(gt_obj["label_name"])
@@ -353,7 +513,7 @@ def choose_missed_gt_anchor(gt_objects, pred_objects, match_distance_thresh):
             missed.append(candidate)
 
     if not missed:
-        return None
+        return []
     missed = sorted(
         missed,
         key=lambda obj: (
@@ -361,7 +521,7 @@ def choose_missed_gt_anchor(gt_objects, pred_objects, match_distance_thresh):
             float(np.linalg.norm(np.asarray(obj["center"][:2], dtype=np.float32))),
         ),
     )
-    return missed[0]
+    return missed
 
 
 def choose_low_conf_prediction(pred_objects):
@@ -378,9 +538,9 @@ def choose_low_conf_prediction(pred_objects):
 
 
 def choose_anchor(gt_objects, pred_objects, match_distance_thresh):
-    missed_anchor = choose_missed_gt_anchor(gt_objects, pred_objects, match_distance_thresh)
-    if missed_anchor is not None:
-        return missed_anchor
+    missed_anchors = choose_missed_gt_anchors(gt_objects, pred_objects, match_distance_thresh)
+    if missed_anchors:
+        return missed_anchors[0]
     return choose_low_conf_prediction(pred_objects)
 
 
@@ -415,22 +575,23 @@ def describe_scene(gt_objects):
     return "；".join(scene_bits) + "。"
 
 
-def explain_anchor(record, anchor, point_cloud_range):
+def explain_anchor(record, anchor, point_cloud_range, local_stats=None):
     if anchor is None:
         return (
             "当前帧没有可用的漏检锚点或低置信目标，说明该场景中的目标较少，"
             "也可能是当前检测结果整体较稳定。"
         )
 
-    camera_strength = region_feature_strength(
-        record.get("camera_bev_path"), anchor["center"], anchor["size"], point_cloud_range
-    )
-    lidar_strength = region_feature_strength(
-        record.get("lidar_bev_path"), anchor["center"], anchor["size"], point_cloud_range
-    )
-    fused_strength = region_feature_strength(
-        record.get("fused_bev_path"), anchor["center"], anchor["size"], point_cloud_range
-    )
+    if local_stats is None:
+        local_stats = summarize_anchor_local_stats(record, anchor, point_cloud_range)
+    camera_strength = float(local_stats["response_strengths"]["camera"])
+    lidar_strength = float(local_stats["response_strengths"]["lidar"])
+    fused_strength = float(local_stats["response_strengths"]["fused"])
+    camera_share = float(local_stats["response_shares"]["camera"])
+    lidar_share = float(local_stats["response_shares"]["lidar"])
+    fused_share = float(local_stats["response_shares"]["fused"])
+    edl_uncertainty = float(local_stats["edl_stats"]["local_uncertainty_mean"])
+    edl_evidence = float(local_stats["edl_stats"]["local_evidence_mean"])
 
     direction = direction_from_xy(anchor["center"][0], anchor["center"][1])
     reasons = []
@@ -445,6 +606,14 @@ def explain_anchor(record, anchor, point_cloud_range):
         reasons.append(
             f"{direction}的 {anchor['label_name']} 预测分数为 {float(anchor.get('score', 0.0)):.2f}"
         )
+    reasons.append(
+        "以目标中心附近的局部 patch 统计来看，"
+        f"camera/lidar/fused 响应约为 {camera_strength:.2f}/{lidar_strength:.2f}/{fused_strength:.2f}，"
+        f"对应局部响应占比约为 {camera_share:.0%}/{lidar_share:.0%}/{fused_share:.0%}"
+    )
+    reasons.append(
+        f"该区域的 EDL 局部平均不确定性约为 {edl_uncertainty:.2f}，平均证据强度约为 {edl_evidence:.2f}"
+    )
     if camera_strength < lidar_strength * 0.8:
         reasons.append("视觉 BEV 响应偏弱，更像是遮挡、逆光、裁剪或纹理不足导致的感知退化")
     elif lidar_strength < camera_strength * 0.8:
@@ -452,10 +621,12 @@ def explain_anchor(record, anchor, point_cloud_range):
     else:
         reasons.append("相机与 LiDAR 的局部响应接近，更像是类别边界模糊或定位偏移，而不是单模态完全失效")
 
-    if fused_strength < max(camera_strength, lidar_strength):
-        reasons.append("融合特征没有明显放大局部证据，说明跨模态互补有限")
+    if fused_strength < 0.8 * max(camera_strength, lidar_strength):
+        reasons.append("融合 BEV 响应低于较强单模态响应，可能说明融合阶段未充分保留该区域证据")
+    elif fused_strength > 1.2 * max(camera_strength, lidar_strength):
+        reasons.append("融合 BEV 响应高于单模态响应，说明跨模态信息在该区域形成了更强证据")
     else:
-        reasons.append("融合特征仍保留了该区域的证据，说明目标并非完全不可见")
+        reasons.append("融合 BEV 响应与较强单模态接近，说明融合特征基本保留了该区域证据")
     return "；".join(reasons) + "。"
 
 
@@ -542,14 +713,53 @@ def sanitize_anchor_object(anchor):
     return payload
 
 
-def build_task_questions(anchor):
-    scene_question = "请概括当前场景的主要交通参与者，并优先说明前方区域的车辆和行人分布。"
+def build_scene_question():
+    return "请概括当前场景的主要交通参与者，并优先说明前方区域的车辆和行人分布。"
+
+
+def build_trust_question():
+    return "请综合 EDL 证据和多模态 BEV 响应，评估当前系统的整体感知可信度，并给出自车的保守建议。"
+
+
+def build_miss_summary_question():
+    return "请总结这一帧中总共有哪几个目标发生了漏检，并简要说明它们的大致方位和类别。"
+
+
+def build_attribution_question(anchor):
     if anchor is not None and anchor["anchor_type"] == "missed_gt":
-        attribution_question = "请结合漏检目标的原图 crop、三路 BEV 响应和 EDL 证据，解释为什么这个目标会被漏检。"
-    else:
-        attribution_question = "请结合目标的原图 crop、三路 BEV 响应和 EDL 证据，解释为什么当前最不稳定的目标置信度偏低。"
-    trust_question = "请综合 EDL 证据和多模态 BEV 响应，评估当前系统的整体感知可信度，并给出自车的保守建议。"
-    return scene_question, attribution_question, trust_question
+        direction = direction_from_xy(anchor["center"][0], anchor["center"][1])
+        return (
+            f"请结合该目标的原图 crop、三路 BEV 响应和 EDL 证据，"
+            f"解释为什么位于{direction}的 {anchor['label_name']} 会被漏检。"
+        )
+    return "请结合目标的原图 crop、三路 BEV 响应和 EDL 证据，解释为什么当前最不稳定的目标置信度偏低。"
+
+
+def build_feature_dict(record):
+    return {
+        "camera": resolve_path(record["camera_bev_path"]) if record.get("camera_bev_path") else None,
+        "lidar": resolve_path(record["lidar_bev_path"]) if record.get("lidar_bev_path") else None,
+        "fused": resolve_path(record["fused_bev_path"]) if record.get("fused_bev_path") else None,
+        "edl_evidence": resolve_path(record["edl_evidence_path"]) if record.get("edl_evidence_path") else None,
+    }
+
+
+def build_miss_summary_answer(missed_gt_anchors):
+    if not missed_gt_anchors:
+        return "当前帧中没有发现明确的 GT 漏检目标，主要风险更可能来自低置信预测或场景本身较为空。"
+
+    summary_bits = []
+    for anchor in missed_gt_anchors:
+        direction = direction_from_xy(anchor["center"][0], anchor["center"][1])
+        summary_bits.append(f"{direction}的 {anchor['label_name']}")
+
+    if len(summary_bits) == 1:
+        return f"当前帧共发现 1 个明确漏检目标，为 {summary_bits[0]}。"
+    return (
+        f"当前帧共发现 {len(summary_bits)} 个明确漏检目标，分别为 "
+        + "、".join(summary_bits)
+        + "。"
+    )
 
 
 def build_sample(
@@ -565,75 +775,97 @@ def build_sample(
     gt_objects = filter_gt_objects(info)
     pred_payload = load_prediction_payload(record["pred_path"])
     pred_objects = pred_payload.get("objects", [])
-    anchor = choose_anchor(gt_objects, pred_objects, match_distance_thresh)
-    anchor_crop = (
-        select_anchor_camera_crop(
-            anchor,
-            info,
-            crop_dir,
-            min_crop_size,
-            crop_padding,
-        )
-        if anchor is not None
-        else None
+    missed_gt_anchors = choose_missed_gt_anchors(
+        gt_objects,
+        pred_objects,
+        match_distance_thresh,
     )
-    image_paths = build_image_list(record, anchor_crop, image_mode)
+    fallback_anchor = choose_low_conf_prediction(pred_objects) if not missed_gt_anchors else None
+    attribution_targets = (
+        missed_gt_anchors
+        if missed_gt_anchors
+        else ([fallback_anchor] if fallback_anchor is not None else [])
+    )
+    primary_anchor = attribution_targets[0] if attribution_targets else None
 
-    scene_question, explanation_question, trust_question = build_task_questions(anchor)
-
+    global_image_paths = build_image_list(record, None, "bev_only")
+    scene_question = build_scene_question()
+    miss_summary_question = build_miss_summary_question()
+    trust_question = build_trust_question()
     scene_answer = describe_scene(gt_objects)
-    explanation_answer = explain_anchor(record, anchor, point_cloud_range)
+    miss_summary_answer = build_miss_summary_answer(missed_gt_anchors)
     trust_answer = build_confidence_answer(
         record,
         pred_payload,
         pred_objects,
-        anchor,
+        primary_anchor,
         point_cloud_range,
     )
 
-    metadata = {
+    base_metadata = {
         "sample_token": record["sample_token"],
         "split": record["split"],
         "pred_path": record["pred_path"],
         "gt_ref": record["gt_ref"],
         "image_mode": image_mode,
         "source_image_paths": record.get("image_paths", []),
-        "anchor_type": anchor["anchor_type"] if anchor is not None else None,
-        "anchor_object": sanitize_anchor_object(anchor),
-        "anchor_crop": anchor_crop,
         "scene_uncertainty": pred_payload.get("scene_uncertainty"),
         "camera_bev_render_path": record.get("camera_bev_render_path"),
         "lidar_bev_render_path": record.get("lidar_bev_render_path"),
         "fused_bev_render_path": record.get("fused_bev_render_path"),
         "edl_render_path": record.get("edl_render_path"),
+        "missed_gt_count": len(missed_gt_anchors),
+        "missed_gt_objects": [sanitize_anchor_object(anchor) for anchor in missed_gt_anchors],
+        "attribution_target_count": len(attribution_targets),
+        "primary_anchor_type": primary_anchor["anchor_type"] if primary_anchor is not None else None,
+        "primary_anchor_object": sanitize_anchor_object(primary_anchor),
+        "primary_anchor_local_stats": (
+            summarize_anchor_local_stats(record, primary_anchor, point_cloud_range)
+            if primary_anchor is not None
+            else None
+        ),
     }
 
-    sharegpt_sample = {
-        "id": record["sample_token"],
-        "images": image_paths,
-        "bev_features": {
-            "camera": resolve_path(record["camera_bev_path"]) if record.get("camera_bev_path") else None,
-            "lidar": resolve_path(record["lidar_bev_path"]) if record.get("lidar_bev_path") else None,
-            "fused": resolve_path(record["fused_bev_path"]) if record.get("fused_bev_path") else None,
-            "edl_evidence": resolve_path(record["edl_evidence_path"]) if record.get("edl_evidence_path") else None,
-        },
+    bev_features = build_feature_dict(record)
+    sharegpt_samples = []
+    flat_samples = []
+    object_crop_metas = []
+    object_sample_ids = []
+
+    frame_metadata = copy.deepcopy(base_metadata)
+    frame_metadata.update(
+        {
+            "sample_kind": "frame",
+            "anchor_type": frame_metadata["primary_anchor_type"],
+            "anchor_object": frame_metadata["primary_anchor_object"],
+            "anchor_crop": None,
+        }
+    )
+    frame_sharegpt_sample = {
+        "id": f"{record['sample_token']}::frame",
+        "sample_token": record["sample_token"],
+        "sample_kind": "frame",
+        "images": global_image_paths,
+        "bev_features": copy.deepcopy(bev_features),
         "conversations": [
             {"from": "human", "value": scene_question},
             {"from": "gpt", "value": scene_answer},
-            {"from": "human", "value": explanation_question},
-            {"from": "gpt", "value": explanation_answer},
+            {"from": "human", "value": miss_summary_question},
+            {"from": "gpt", "value": miss_summary_answer},
             {"from": "human", "value": trust_question},
             {"from": "gpt", "value": trust_answer},
         ],
-        "metadata": metadata,
+        "metadata": frame_metadata,
     }
+    sharegpt_samples.append(frame_sharegpt_sample)
 
-    flat_samples = []
     for task_type, question, answer in (
         ("scene", scene_question, scene_answer),
-        ("attribution", explanation_question, explanation_answer),
+        ("miss_summary", miss_summary_question, miss_summary_answer),
         ("trust", trust_question, trust_answer),
     ):
+        task_metadata = copy.deepcopy(frame_metadata)
+        task_metadata["task_type"] = task_type
         flat_samples.append(
             {
                 "id": f"{record['sample_token']}::{task_type}",
@@ -641,27 +873,99 @@ def build_sample(
                 "task_type": task_type,
                 "question": question,
                 "answer": answer,
-                "images": image_paths,
-                "bev_features": {
-                    "camera": resolve_path(record["camera_bev_path"]) if record.get("camera_bev_path") else None,
-                    "lidar": resolve_path(record["lidar_bev_path"]) if record.get("lidar_bev_path") else None,
-                    "fused": resolve_path(record["fused_bev_path"]) if record.get("fused_bev_path") else None,
-                    "edl_evidence": resolve_path(record["edl_evidence_path"]) if record.get("edl_evidence_path") else None,
-                },
-                "metadata": copy.deepcopy(metadata),
+                "images": list(global_image_paths),
+                "bev_features": copy.deepcopy(bev_features),
+                "metadata": task_metadata,
+            }
+        )
+
+    for target_idx, anchor in enumerate(attribution_targets):
+        anchor_local_stats = (
+            summarize_anchor_local_stats(record, anchor, point_cloud_range)
+            if anchor is not None
+            else None
+        )
+        anchor_crop = (
+            select_anchor_camera_crop(
+                anchor,
+                info,
+                crop_dir,
+                min_crop_size,
+                crop_padding,
+                crop_name_suffix=f"attr_{target_idx}",
+            )
+            if anchor is not None and image_mode == "anchor_crop"
+            else None
+        )
+        attribution_question = build_attribution_question(anchor)
+        attribution_answer = explain_anchor(
+            record,
+            anchor,
+            point_cloud_range,
+            local_stats=anchor_local_stats,
+        )
+        attr_images = build_image_list(record, anchor_crop, image_mode)
+        attr_sample_id = f"{record['sample_token']}::attr::{target_idx}"
+        object_sample_ids.append(attr_sample_id)
+        object_crop_metas.append(anchor_crop)
+
+        object_metadata = copy.deepcopy(base_metadata)
+        object_metadata.update(
+            {
+                "sample_kind": "object",
+                "task_type": "attribution_object",
+                "target_index": target_idx,
+                "anchor_type": anchor["anchor_type"] if anchor is not None else None,
+                "anchor_object": sanitize_anchor_object(anchor),
+                "anchor_crop": anchor_crop,
+                "anchor_local_stats": anchor_local_stats,
+            }
+        )
+
+        sharegpt_samples.append(
+            {
+                "id": attr_sample_id,
+                "sample_token": record["sample_token"],
+                "sample_kind": "object",
+                "images": attr_images,
+                "bev_features": copy.deepcopy(bev_features),
+                "conversations": [
+                    {"from": "human", "value": attribution_question},
+                    {"from": "gpt", "value": attribution_answer},
+                ],
+                "metadata": object_metadata,
+            }
+        )
+
+        flat_samples.append(
+            {
+                "id": attr_sample_id,
+                "sample_token": record["sample_token"],
+                "task_type": "attribution_object",
+                "question": attribution_question,
+                "answer": attribution_answer,
+                "images": attr_images,
+                "bev_features": copy.deepcopy(bev_features),
+                "metadata": object_metadata,
             }
         )
 
     enriched_manifest_row = copy.deepcopy(record)
     enriched_manifest_row.update(
         {
-            "anchor_type": anchor["anchor_type"] if anchor is not None else None,
-            "anchor_object": sanitize_anchor_object(anchor),
-            "anchor_crop_path": anchor_crop["crop_path"] if anchor_crop is not None else None,
-            "anchor_crop_meta": anchor_crop,
+            "anchor_type": primary_anchor["anchor_type"] if primary_anchor is not None else None,
+            "anchor_object": sanitize_anchor_object(primary_anchor),
+            "anchor_crop_path": object_crop_metas[0]["crop_path"] if object_crop_metas and object_crop_metas[0] is not None else None,
+            "anchor_crop_meta": object_crop_metas[0] if object_crop_metas else None,
+            "missed_gt_count": len(missed_gt_anchors),
+            "missed_gt_objects": [sanitize_anchor_object(anchor) for anchor in missed_gt_anchors],
+            "attribution_target_count": len(attribution_targets),
+            "attribution_targets": [sanitize_anchor_object(anchor) for anchor in attribution_targets],
+            "attribution_sample_ids": object_sample_ids,
+            "anchor_crops": [meta for meta in object_crop_metas if meta is not None],
         }
     )
-    return sharegpt_sample, flat_samples, enriched_manifest_row
+    return sharegpt_samples, flat_samples, enriched_manifest_row
 
 
 def main():
@@ -693,7 +997,7 @@ def main():
         info = gt_lookup.get(record["sample_token"])
         if info is None:
             continue
-        sharegpt_sample, sample_flat_rows, manifest_row = build_sample(
+        sample_sharegpt_rows, sample_flat_rows, manifest_row = build_sample(
             record,
             info,
             args.point_cloud_range,
@@ -703,7 +1007,7 @@ def main():
             args.crop_padding,
             args.match_distance_thresh,
         )
-        samples.append(sharegpt_sample)
+        samples.extend(sample_sharegpt_rows)
         flat_samples.extend(sample_flat_rows)
         enriched_manifest.append(manifest_row)
 
