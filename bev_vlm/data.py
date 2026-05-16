@@ -19,6 +19,102 @@ def task_type_to_id(task_type):
     return TASK_TO_ID.get(task_type, 0)
 
 
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_float(value):
+    parsed = _safe_float(value)
+    if parsed is None:
+        return None
+    return f"{parsed:.2f}"
+
+
+def describe_anchor_brief(anchor):
+    if not anchor:
+        return None
+    direction = anchor.get("direction")
+    label = anchor.get("label_name") or anchor.get("label")
+    if direction and label:
+        return f"{direction}的 {label}"
+    if label:
+        return str(label)
+    return None
+
+
+def build_local_context_prompt(record):
+    metadata = record.get("metadata", {}) or {}
+    task_type = record.get("task_type", "")
+    context_bits = []
+
+    if task_type == "miss_summary":
+        missed_gt_count = metadata.get("missed_gt_count")
+        if missed_gt_count is not None:
+            context_bits.append(f"漏检目标数量={int(missed_gt_count)}")
+        missed_gt_objects = metadata.get("missed_gt_objects") or []
+        briefs = [describe_anchor_brief(anchor) for anchor in missed_gt_objects]
+        briefs = [brief for brief in briefs if brief]
+        if briefs:
+            context_bits.append("漏检目标=" + "、".join(briefs[:8]))
+    elif task_type == "trust":
+        scene_uncertainty = _format_float(metadata.get("scene_uncertainty"))
+        if scene_uncertainty is not None:
+            context_bits.append(f"场景不确定性={scene_uncertainty}")
+        primary_anchor = metadata.get("primary_anchor_object") or metadata.get("anchor_object")
+        primary_anchor_brief = describe_anchor_brief(primary_anchor)
+        if primary_anchor_brief:
+            context_bits.append(f"关键目标={primary_anchor_brief}")
+        local_stats = metadata.get("primary_anchor_local_stats") or metadata.get("anchor_local_stats") or {}
+        response_strengths = local_stats.get("response_strengths") or {}
+        camera_strength = _format_float(response_strengths.get("camera"))
+        lidar_strength = _format_float(response_strengths.get("lidar"))
+        fused_strength = _format_float(response_strengths.get("fused"))
+        if camera_strength and lidar_strength and fused_strength:
+            context_bits.append(
+                "局部响应="
+                f"camera:{camera_strength},lidar:{lidar_strength},fused:{fused_strength}"
+            )
+        edl_stats = local_stats.get("edl_stats") or {}
+        local_uncertainty = _format_float(edl_stats.get("local_uncertainty_mean"))
+        if local_uncertainty is not None:
+            context_bits.append(f"局部EDL不确定性={local_uncertainty}")
+    elif task_type in {"attribution", "attribution_object"}:
+        anchor = metadata.get("anchor_object") or metadata.get("primary_anchor_object")
+        anchor_brief = describe_anchor_brief(anchor)
+        if anchor_brief:
+            context_bits.append(f"目标={anchor_brief}")
+        nearby_prediction = (anchor or {}).get("nearby_prediction") or {}
+        nearby_label = nearby_prediction.get("label_name")
+        nearby_score = _format_float(nearby_prediction.get("score"))
+        if nearby_label is not None and nearby_score is not None:
+            context_bits.append(f"最近预测={nearby_label}:{nearby_score}")
+        local_stats = metadata.get("anchor_local_stats") or metadata.get("primary_anchor_local_stats") or {}
+        response_strengths = local_stats.get("response_strengths") or {}
+        camera_strength = _format_float(response_strengths.get("camera"))
+        lidar_strength = _format_float(response_strengths.get("lidar"))
+        fused_strength = _format_float(response_strengths.get("fused"))
+        if camera_strength and lidar_strength and fused_strength:
+            context_bits.append(
+                "局部响应="
+                f"camera:{camera_strength},lidar:{lidar_strength},fused:{fused_strength}"
+            )
+        edl_stats = local_stats.get("edl_stats") or {}
+        local_uncertainty = _format_float(edl_stats.get("local_uncertainty_mean"))
+        if local_uncertainty is not None:
+            context_bits.append(f"局部EDL不确定性={local_uncertainty}")
+
+    if not context_bits:
+        return record["question"]
+    return "线索：" + "；".join(context_bits) + "\n问题：" + record["question"]
+
+
+def build_model_input_text(record):
+    return build_local_context_prompt(record)
+
+
 def load_records(path):
     path = Path(path)
     if path.suffix == ".jsonl":
@@ -77,8 +173,9 @@ class FlatBEVQADataset(Dataset):
 
     def __getitem__(self, index):
         record = self.records[index]
+        model_input_text = build_model_input_text(record)
         question_ids = self.tokenizer.encode(
-            record["question"],
+            model_input_text,
             add_bos=True,
             add_eos=True,
             max_length=self.max_question_length,
@@ -100,6 +197,7 @@ class FlatBEVQADataset(Dataset):
             "answer_ids": torch.tensor(answer_ids, dtype=torch.long),
             "task_id": torch.tensor(task_type_to_id(record["task_type"]), dtype=torch.long),
             "bev_tensors": bev_tensors,
+            "model_input_text": model_input_text,
             "record": record,
         }
 
@@ -131,6 +229,7 @@ def collate_flat_bev_qa(batch, pad_id=0):
         "answer_ids": answer_ids,
         "task_ids": task_ids,
         "bev_tensors": bev_tensors,
+        "model_input_texts": [item["model_input_text"] for item in batch],
         "records": [item["record"] for item in batch],
     }
 

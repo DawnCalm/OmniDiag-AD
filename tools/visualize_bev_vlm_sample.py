@@ -1,4 +1,5 @@
 import argparse
+import os
 import textwrap
 from pathlib import Path
 
@@ -19,6 +20,11 @@ def parse_args():
         "--output",
         default="outputs/bev_vlm/sample_panel.png",
         help="output image path",
+    )
+    parser.add_argument(
+        "--font-path",
+        default=None,
+        help="optional path to a TTF/TTC/OTF font file; use this when Chinese text renders as squares",
     )
     return parser.parse_args()
 
@@ -43,20 +49,73 @@ def to_pil_image(image):
     return Image.fromarray(image.astype(np.uint8))
 
 
-def load_font(size):
-    candidate_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    ]
+def discover_font_path(user_font_path=None):
+    candidate_paths = []
+    if user_font_path:
+        candidate_paths.append(user_font_path)
+    env_font = os.environ.get("BEV_VLM_FONT_PATH")
+    if env_font:
+        candidate_paths.append(env_font)
+
+    candidate_paths.extend(
+        [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKSC-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJKSC-Regular.otf",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/arphic/ukai.ttc",
+            "/usr/share/fonts/truetype/arphic/uming.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    )
+
     for candidate in candidate_paths:
         path = Path(candidate)
         if path.exists():
-            try:
-                return ImageFont.truetype(str(path), size=size)
-            except Exception:
-                continue
-    return ImageFont.load_default()
+            return path
+
+    search_roots = [
+        Path("/usr/share/fonts"),
+        Path("/usr/local/share/fonts"),
+        Path.home() / ".fonts",
+    ]
+    patterns = [
+        "*NotoSansCJK*",
+        "*NotoSansSC*",
+        "*SourceHanSans*",
+        "*WenQuanYi*",
+        "*wqy*",
+        "*ukai*",
+        "*uming*",
+        "*SimHei*",
+        "*MSYH*",
+        "*YaHei*",
+        "*PingFang*",
+        "*Heiti*",
+        "*Sarasa*",
+        "*DroidSansFallback*",
+        "*DejaVuSans.ttf",
+    ]
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for pattern in patterns:
+            matches = sorted(root.rglob(pattern))
+            if matches:
+                return matches[0]
+    return None
+
+
+def load_font(size, font_path=None):
+    resolved_font_path = discover_font_path(font_path)
+    if resolved_font_path is not None:
+        try:
+            return ImageFont.truetype(str(resolved_font_path), size=size), str(resolved_font_path)
+        except Exception:
+            pass
+    return ImageFont.load_default(), None
 
 
 def wrap_text(text, width):
@@ -103,8 +162,22 @@ def main():
     text_width = 520
     canvas = Image.new("RGB", (grid_width + text_width + 32, max(grid_height, 900)), color=(250, 250, 250))
     draw = ImageDraw.Draw(canvas)
-    title_font = load_font(24)
-    body_font = load_font(20)
+    title_font, resolved_font_path = load_font(24, args.font_path)
+    body_font, _ = load_font(20, args.font_path)
+    sample_text = " ".join(block["value"] for block in sample.get("conversations", [])) if "conversations" in sample else " ".join(
+        [sample.get("question", ""), sample.get("answer", "")]
+    )
+    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in sample_text)
+    if has_cjk and resolved_font_path is None:
+        print(
+            "Warning: no Chinese-capable font was found. Text may render as squares. "
+            "Pass --font-path /path/to/NotoSansCJK-Regular.ttc or set BEV_VLM_FONT_PATH."
+        )
+    elif has_cjk and resolved_font_path is not None and "dejavu" in resolved_font_path.lower():
+        print(
+            f"Warning: using fallback font {resolved_font_path}, which may not support Chinese fully. "
+            "Pass --font-path /path/to/a CJK font if text renders as squares."
+        )
 
     for idx, (image, caption) in enumerate(zip(pil_images, captions)):
         row = idx // columns

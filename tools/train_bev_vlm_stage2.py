@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from bev_vlm.connectors import count_trainable_parameters
 from bev_vlm.data import (
     FlatBEVQADataset,
+    build_model_input_text,
     collate_flat_bev_qa,
     load_records,
     save_json,
@@ -96,7 +97,8 @@ def main():
 
     tokenizer = SimpleCharTokenizer()
     tokenizer.fit(
-        [record["question"] for record in records] + [record["answer"] for record in records]
+        [build_model_input_text(record) for record in records]
+        + [record["answer"] for record in records]
     )
 
     train_records, val_records = split_records(records, val_ratio=args.val_ratio, seed=args.seed)
@@ -206,6 +208,8 @@ def main():
             "hidden_size": args.hidden_size,
             "token_grid": args.token_grid,
             "vocab_size": tokenizer.vocab_size,
+            "max_question_length": args.max_question_length,
+            "max_answer_length": args.max_answer_length,
             "connector_trainable_params": count_trainable_parameters(model.connector),
         },
     )
