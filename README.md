@@ -69,3 +69,8 @@ Use the same flat dataset and enriched manifest, then switch to the server-stage
 - `tools/train_bev_vlm_stage3_server.py`
 
 These scripts are designed for a server environment with `transformers`, `peft`, and optionally `bitsandbytes` installed.
+
+For the current executable server workflow, see:
+
+- [SERVER_STAGE.md](/root/bevfusion/SERVER_STAGE.md)
+- [CODEX_HANDOFF.md](/root/bevfusion/CODEX_HANDOFF.md)

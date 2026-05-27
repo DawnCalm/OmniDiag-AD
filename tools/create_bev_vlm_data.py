@@ -7,8 +7,10 @@ from pathlib import Path
 import mmcv
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from bev_vlm.data import save_json, save_jsonl
+from bev_vlm.visualization import save_feature_render
 
 CAMERA_YAW_DEGREES = {
     "CAM_FRONT": 0.0,
@@ -82,6 +84,25 @@ def parse_args():
         type=float,
         default=2.5,
         help="minimum XY distance threshold used when deciding whether a GT object was missed",
+    )
+    parser.add_argument(
+        "--local-patch-dir",
+        default=None,
+        help="directory used to save target-centric local BEV/EDL patches",
+    )
+    parser.add_argument(
+        "--local-patch-scale",
+        type=float,
+        default=4.0,
+        help="context multiplier applied when cropping local BEV/EDL patches around an anchor",
+    )
+    parser.add_argument(
+        "--local-patch-grid",
+        nargs=2,
+        type=int,
+        default=[32, 32],
+        metavar=("HEIGHT", "WIDTH"),
+        help="fixed H W used when saving local BEV/EDL patch tensors",
     )
     return parser.parse_args()
 
@@ -355,7 +376,19 @@ def xy_to_grid(x, y, height, width, point_cloud_range):
     return max(0, min(width - 1, grid_x)), max(0, min(height - 1, grid_y))
 
 
-def extract_feature_patch(feature_path, center, size, point_cloud_range):
+def compute_patch_bounds(center, size, tensor_height, tensor_width, point_cloud_range, context_scale=1.0):
+    x, y = center[:2]
+    length = max(size[0], 1.0) * context_scale
+    width_m = max(size[1], 1.0) * context_scale
+    cx, cy = xy_to_grid(x, y, tensor_height, tensor_width, point_cloud_range)
+    x_radius = max(1, int(round(length / (point_cloud_range[2] - point_cloud_range[0]) * tensor_width * 0.5)))
+    y_radius = max(1, int(round(width_m / (point_cloud_range[3] - point_cloud_range[1]) * tensor_height * 0.5)))
+    x0, x1 = max(0, cx - x_radius), min(tensor_width, cx + x_radius + 1)
+    y0, y1 = max(0, cy - y_radius), min(tensor_height, cy + y_radius + 1)
+    return x0, y0, x1, y1, cx, cy
+
+
+def extract_feature_patch(feature_path, center, size, point_cloud_range, context_scale=1.0):
     if not feature_path:
         return None
     tensor = torch.load(resolve_path(feature_path), map_location="cpu").float()
@@ -363,18 +396,95 @@ def extract_feature_patch(feature_path, center, size, point_cloud_range):
         raise ValueError(f"Expected CHW tensor in {feature_path}, got shape {tuple(tensor.shape)}")
 
     _, height, width = tensor.shape
-    x, y = center[:2]
-    length = max(size[0], 1.0)
-    width_m = max(size[1], 1.0)
-    cx, cy = xy_to_grid(x, y, height, width, point_cloud_range)
-    x_radius = max(1, int(round(length / (point_cloud_range[2] - point_cloud_range[0]) * width * 0.5)))
-    y_radius = max(1, int(round(width_m / (point_cloud_range[3] - point_cloud_range[1]) * height * 0.5)))
-    x0, x1 = max(0, cx - x_radius), min(width, cx + x_radius + 1)
-    y0, y1 = max(0, cy - y_radius), min(height, cy + y_radius + 1)
+    x0, y0, x1, y1, _, _ = compute_patch_bounds(
+        center,
+        size,
+        height,
+        width,
+        point_cloud_range,
+        context_scale=context_scale,
+    )
     patch = tensor[:, y0:y1, x0:x1]
     if patch.numel() == 0:
         return None
     return patch
+
+
+def resize_feature_patch(patch, output_grid):
+    if patch is None:
+        return None
+    output_grid = tuple(int(v) for v in output_grid)
+    if tuple(patch.shape[-2:]) == output_grid:
+        return patch.contiguous()
+    resized = F.interpolate(
+        patch.unsqueeze(0),
+        size=output_grid,
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+    return resized.contiguous()
+
+
+def save_tensor_patch(path, patch):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(patch.detach().cpu().half(), str(path))
+    return str(path.resolve())
+
+
+def build_local_patch_assets(
+    record,
+    anchor,
+    patch_dir,
+    sample_id,
+    point_cloud_range,
+    local_patch_scale,
+    local_patch_grid,
+):
+    if anchor is None:
+        return None
+    patch_dir = Path(patch_dir)
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    feature_sources = {
+        "camera": record.get("camera_bev_path"),
+        "lidar": record.get("lidar_bev_path"),
+        "fused": record.get("fused_bev_path"),
+        "edl_evidence": record.get("edl_evidence_path"),
+    }
+    tensor_paths = {}
+    render_paths = {}
+    patch_shapes = {}
+    for name, feature_path in feature_sources.items():
+        if not feature_path:
+            tensor_paths[name] = None
+            render_paths[name] = None
+            patch_shapes[name] = None
+            continue
+        patch = extract_feature_patch(
+            feature_path,
+            anchor["center"],
+            anchor["size"],
+            point_cloud_range,
+            context_scale=local_patch_scale,
+        )
+        patch = resize_feature_patch(patch, local_patch_grid)
+        if patch is None:
+            tensor_paths[name] = None
+            render_paths[name] = None
+            patch_shapes[name] = None
+            continue
+        tensor_path = save_tensor_patch(patch_dir / f"{sample_id}_{name}_local.pt", patch)
+        render_path = save_feature_render(patch, patch_dir / f"{sample_id}_{name}_local.png")
+        tensor_paths[name] = tensor_path
+        render_paths[name] = render_path
+        patch_shapes[name] = [int(v) for v in patch.shape]
+    return {
+        "bev_features": tensor_paths,
+        "renders": render_paths,
+        "patch_shapes": patch_shapes,
+        "local_patch_scale": float(local_patch_scale),
+        "local_patch_grid": [int(v) for v in local_patch_grid],
+    }
 
 
 def region_feature_strength(feature_path, center, size, point_cloud_range):
@@ -677,8 +787,28 @@ def build_confidence_answer(record, pred_payload, pred_objects, anchor, point_cl
     return f"当前场景整体感知可信度约为 {confidence:.2f}。{advice}"
 
 
-def build_image_list(record, anchor_crop, image_mode):
+def build_image_list(record, anchor_crop, image_mode, task_type=None, local_patch_assets=None):
     image_paths = []
+    if task_type == "scene":
+        value = record.get("fused_bev_render_path")
+        return [resolve_path(value)] if value else []
+    if task_type in {"miss_summary", "trust", "frame"}:
+        for key in ("fused_bev_render_path", "edl_render_path"):
+            value = record.get(key)
+            if value:
+                image_paths.append(resolve_path(value))
+        return image_paths
+    if task_type == "attribution_object" and local_patch_assets is not None:
+        if image_mode == "anchor_crop" and anchor_crop is not None:
+            image_paths.append(anchor_crop["crop_path"])
+        for key in ("camera", "lidar", "fused", "edl_evidence"):
+            value = local_patch_assets.get("renders", {}).get(key)
+            if value:
+                image_paths.append(resolve_path(value))
+        global_fused = record.get("fused_bev_render_path")
+        if global_fused:
+            image_paths.append(resolve_path(global_fused))
+        return image_paths
     if image_mode == "anchor_crop" and anchor_crop is not None:
         image_paths.append(anchor_crop["crop_path"])
     for key in (
@@ -744,6 +874,19 @@ def build_feature_dict(record):
     }
 
 
+def build_attribution_feature_dict(record, local_patch_assets):
+    if local_patch_assets is None:
+        return build_feature_dict(record)
+    local_features = local_patch_assets.get("bev_features", {})
+    fallback = build_feature_dict(record)
+    return {
+        "camera": local_features.get("camera") or fallback["camera"],
+        "lidar": local_features.get("lidar") or fallback["lidar"],
+        "fused": local_features.get("fused") or fallback["fused"],
+        "edl_evidence": local_features.get("edl_evidence") or fallback["edl_evidence"],
+    }
+
+
 def build_miss_summary_answer(missed_gt_anchors):
     if not missed_gt_anchors:
         return "当前帧中没有发现明确的 GT 漏检目标，主要风险更可能来自低置信预测或场景本身较为空。"
@@ -768,9 +911,12 @@ def build_sample(
     point_cloud_range,
     image_mode,
     crop_dir,
+    local_patch_dir,
     min_crop_size,
     crop_padding,
     match_distance_thresh,
+    local_patch_scale,
+    local_patch_grid,
 ):
     gt_objects = filter_gt_objects(info)
     pred_payload = load_prediction_payload(record["pred_path"])
@@ -788,7 +934,7 @@ def build_sample(
     )
     primary_anchor = attribution_targets[0] if attribution_targets else None
 
-    global_image_paths = build_image_list(record, None, "bev_only")
+    frame_image_paths = build_image_list(record, None, "bev_only", task_type="frame")
     scene_question = build_scene_question()
     miss_summary_question = build_miss_summary_question()
     trust_question = build_trust_question()
@@ -845,7 +991,7 @@ def build_sample(
         "id": f"{record['sample_token']}::frame",
         "sample_token": record["sample_token"],
         "sample_kind": "frame",
-        "images": global_image_paths,
+        "images": frame_image_paths,
         "bev_features": copy.deepcopy(bev_features),
         "conversations": [
             {"from": "human", "value": scene_question},
@@ -866,6 +1012,7 @@ def build_sample(
     ):
         task_metadata = copy.deepcopy(frame_metadata)
         task_metadata["task_type"] = task_type
+        task_images = build_image_list(record, None, "bev_only", task_type=task_type)
         flat_samples.append(
             {
                 "id": f"{record['sample_token']}::{task_type}",
@@ -873,7 +1020,7 @@ def build_sample(
                 "task_type": task_type,
                 "question": question,
                 "answer": answer,
-                "images": list(global_image_paths),
+                "images": task_images,
                 "bev_features": copy.deepcopy(bev_features),
                 "metadata": task_metadata,
             }
@@ -904,8 +1051,24 @@ def build_sample(
             point_cloud_range,
             local_stats=anchor_local_stats,
         )
-        attr_images = build_image_list(record, anchor_crop, image_mode)
         attr_sample_id = f"{record['sample_token']}::attr::{target_idx}"
+        local_patch_assets = build_local_patch_assets(
+            record,
+            anchor,
+            local_patch_dir,
+            attr_sample_id.replace("::", "_"),
+            point_cloud_range,
+            local_patch_scale,
+            local_patch_grid,
+        )
+        attr_images = build_image_list(
+            record,
+            anchor_crop,
+            image_mode,
+            task_type="attribution_object",
+            local_patch_assets=local_patch_assets,
+        )
+        attr_bev_features = build_attribution_feature_dict(record, local_patch_assets)
         object_sample_ids.append(attr_sample_id)
         object_crop_metas.append(anchor_crop)
 
@@ -919,6 +1082,7 @@ def build_sample(
                 "anchor_object": sanitize_anchor_object(anchor),
                 "anchor_crop": anchor_crop,
                 "anchor_local_stats": anchor_local_stats,
+                "local_patch_assets": local_patch_assets,
             }
         )
 
@@ -928,7 +1092,7 @@ def build_sample(
                 "sample_token": record["sample_token"],
                 "sample_kind": "object",
                 "images": attr_images,
-                "bev_features": copy.deepcopy(bev_features),
+                "bev_features": copy.deepcopy(attr_bev_features),
                 "conversations": [
                     {"from": "human", "value": attribution_question},
                     {"from": "gpt", "value": attribution_answer},
@@ -945,7 +1109,7 @@ def build_sample(
                 "question": attribution_question,
                 "answer": attribution_answer,
                 "images": attr_images,
-                "bev_features": copy.deepcopy(bev_features),
+                "bev_features": copy.deepcopy(attr_bev_features),
                 "metadata": object_metadata,
             }
         )
@@ -989,6 +1153,9 @@ def main():
     crop_dir = args.crop_dir
     if crop_dir is None:
         crop_dir = str(output_path.parent / "anchor_crops")
+    local_patch_dir = args.local_patch_dir
+    if local_patch_dir is None:
+        local_patch_dir = str(output_path.parent / "local_patches")
 
     samples = []
     flat_samples = []
@@ -1003,9 +1170,12 @@ def main():
             args.point_cloud_range,
             args.image_mode,
             crop_dir,
+            local_patch_dir,
             args.min_crop_size,
             args.crop_padding,
             args.match_distance_thresh,
+            args.local_patch_scale,
+            args.local_patch_grid,
         )
         samples.extend(sample_sharegpt_rows)
         flat_samples.extend(sample_flat_rows)

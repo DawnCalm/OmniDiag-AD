@@ -3,6 +3,7 @@ import random
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
@@ -210,6 +211,24 @@ def _pad_sequence(sequences, pad_value):
     return padded
 
 
+def _resize_chw_tensor(tensor, size):
+    if tuple(tensor.shape[-2:]) == tuple(size):
+        return tensor
+    return F.interpolate(
+        tensor.unsqueeze(0).float(),
+        size=tuple(size),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+
+
+def _stack_chw_tensors(tensors):
+    target_h = max(int(tensor.shape[-2]) for tensor in tensors)
+    target_w = max(int(tensor.shape[-1]) for tensor in tensors)
+    resized = [_resize_chw_tensor(tensor, (target_h, target_w)) for tensor in tensors]
+    return torch.stack(resized, dim=0)
+
+
 def collate_flat_bev_qa(batch, pad_id=0):
     question_ids = _pad_sequence([item["question_ids"] for item in batch], pad_id)
     answer_ids = _pad_sequence([item["answer_ids"] for item in batch], pad_id)
@@ -218,9 +237,8 @@ def collate_flat_bev_qa(batch, pad_id=0):
     modality_names = list(batch[0]["bev_tensors"].keys())
     bev_tensors = {}
     for modality in modality_names:
-        bev_tensors[modality] = torch.stack(
-            [item["bev_tensors"][modality] for item in batch],
-            dim=0,
+        bev_tensors[modality] = _stack_chw_tensors(
+            [item["bev_tensors"][modality] for item in batch]
         )
 
     return {

@@ -1,7 +1,10 @@
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
+
+from .data import build_model_input_text
 
 
 def build_prompt(question, task_type):
@@ -24,12 +27,31 @@ def _load_images(image_paths, max_images):
     return images
 
 
+def _resize_chw_tensor(tensor, size):
+    if tuple(tensor.shape[-2:]) == tuple(size):
+        return tensor
+    return F.interpolate(
+        tensor.unsqueeze(0).float(),
+        size=tuple(size),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+
+
+def _stack_chw_tensors(tensors):
+    target_h = max(int(tensor.shape[-2]) for tensor in tensors)
+    target_w = max(int(tensor.shape[-1]) for tensor in tensors)
+    resized = [_resize_chw_tensor(tensor, (target_h, target_w)) for tensor in tensors]
+    return torch.stack(resized, dim=0)
+
+
 def collate_server_batch(
     batch,
     tokenizer,
     image_processor,
     max_text_length=512,
     max_images=5,
+    prompt_mode="question_only",
 ):
     text_inputs = []
     text_masks = []
@@ -39,7 +61,12 @@ def collate_server_batch(
     bev_tensors = {"camera": [], "lidar": [], "fused": []}
 
     for record in batch:
-        prompt = build_prompt(record["question"], record.get("task_type", "scene"))
+        prompt_question = (
+            build_model_input_text(record)
+            if prompt_mode == "structured"
+            else record["question"]
+        )
+        prompt = build_prompt(prompt_question, record.get("task_type", "scene"))
         full_text = prompt + " " + record["answer"]
 
         prompt_ids = tokenizer(
@@ -83,7 +110,7 @@ def collate_server_batch(
     labels = _pad_sequences(label_inputs, -100)
 
     stacked_bev = {
-        modality: torch.stack(bev_list, dim=0)
+        modality: _stack_chw_tensors(bev_list)
         for modality, bev_list in bev_tensors.items()
     }
 
@@ -140,32 +167,65 @@ def move_server_batch_to_device(batch, device):
     return moved
 
 
-def train_server_epoch(model, data_loader, optimizer, device, max_steps=None):
+def train_server_epoch(
+    model,
+    data_loader,
+    optimizer,
+    device,
+    max_steps=None,
+    gradient_accumulation_steps=1,
+    max_grad_norm=None,
+    use_autocast=False,
+    autocast_dtype=torch.float16,
+):
     model.train()
     total_loss = 0.0
     steps = 0
+    optimizer.zero_grad()
     for step_idx, batch in enumerate(data_loader):
         if max_steps is not None and step_idx >= max_steps:
             break
         batch = move_server_batch_to_device(batch, device)
-        outputs = model(
-            bev_tensors=batch["bev_tensors"],
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["labels"],
-            pixel_values=batch["pixel_values"],
-        )
-        loss = outputs.loss
-        optimizer.zero_grad()
+        with torch.cuda.amp.autocast(
+            enabled=use_autocast and str(device).startswith("cuda"),
+            dtype=autocast_dtype,
+        ):
+            outputs = model(
+                bev_tensors=batch["bev_tensors"],
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
+                pixel_values=batch["pixel_values"],
+            )
+            raw_loss = outputs.loss
+            loss = raw_loss / max(gradient_accumulation_steps, 1)
         loss.backward()
-        optimizer.step()
-        total_loss += float(loss.item())
+
+        should_step = (step_idx + 1) % max(gradient_accumulation_steps, 1) == 0
+        if should_step:
+            if max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+        total_loss += float(raw_loss.item())
         steps += 1
+    if steps > 0 and steps % max(gradient_accumulation_steps, 1) != 0:
+        if max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad()
     return total_loss / max(steps, 1)
 
 
 @torch.no_grad()
-def evaluate_server_loss(model, data_loader, device, max_steps=None):
+def evaluate_server_loss(
+    model,
+    data_loader,
+    device,
+    max_steps=None,
+    use_autocast=False,
+    autocast_dtype=torch.float16,
+):
     model.eval()
     total_loss = 0.0
     steps = 0
@@ -173,13 +233,17 @@ def evaluate_server_loss(model, data_loader, device, max_steps=None):
         if max_steps is not None and step_idx >= max_steps:
             break
         batch = move_server_batch_to_device(batch, device)
-        outputs = model(
-            bev_tensors=batch["bev_tensors"],
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["labels"],
-            pixel_values=batch["pixel_values"],
-        )
+        with torch.cuda.amp.autocast(
+            enabled=use_autocast and str(device).startswith("cuda"),
+            dtype=autocast_dtype,
+        ):
+            outputs = model(
+                bev_tensors=batch["bev_tensors"],
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
+                pixel_values=batch["pixel_values"],
+            )
         total_loss += float(outputs.loss.item())
         steps += 1
     return total_loss / max(steps, 1)

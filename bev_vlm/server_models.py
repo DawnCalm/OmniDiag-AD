@@ -21,11 +21,12 @@ except ImportError:  # pragma: no cover - optional dependency
     BitsAndBytesConfig = None
 
 try:
-    from peft import LoraConfig, TaskType, get_peft_model
+    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 except ImportError:  # pragma: no cover - optional dependency
     LoraConfig = None
     TaskType = None
     get_peft_model = None
+    prepare_model_for_kbit_training = None
 
 
 def require_transformers():
@@ -44,12 +45,40 @@ def require_peft():
         )
 
 
+def require_kbit_support():
+    require_peft()
+    if prepare_model_for_kbit_training is None:
+        raise ImportError(
+            "prepare_model_for_kbit_training is required for QLoRA fine-tuning. "
+            "Please install a recent version of peft in the server environment."
+        )
+
+
 def resolve_torch_dtype(dtype_name):
     if dtype_name == "bfloat16":
         return torch.bfloat16
     if dtype_name == "float32":
         return torch.float32
     return torch.float16
+
+
+def normalize_runtime_device(device):
+    if device is None:
+        return None
+    if isinstance(device, torch.device):
+        return str(device)
+    return str(device)
+
+
+def build_single_device_map(device):
+    device = normalize_runtime_device(device)
+    if device is None:
+        return None
+    if device.startswith("cuda"):
+        if ":" in device:
+            return {"": int(device.split(":", 1)[1])}
+        return {"": 0}
+    return {"": device}
 
 
 def freeze_module(module):
@@ -91,11 +120,15 @@ class ServerQFormerLLM(nn.Module):
         lora_alpha=32,
         lora_dropout=0.05,
         lora_target_modules=None,
+        gradient_checkpointing=False,
+        runtime_device=None,
+        trust_remote_code=False,
     ):
         super().__init__()
         require_transformers()
 
         dtype = resolve_torch_dtype(torch_dtype)
+        runtime_device = normalize_runtime_device(runtime_device)
         llm_kwargs = {}
         if use_qlora:
             if BitsAndBytesConfig is None:
@@ -109,18 +142,29 @@ class ServerQFormerLLM(nn.Module):
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
+            llm_kwargs["device_map"] = build_single_device_map(runtime_device) or "auto"
         else:
             llm_kwargs["torch_dtype"] = dtype
+        llm_kwargs["trust_remote_code"] = trust_remote_code
 
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_model_name,
             **llm_kwargs,
         )
+        if gradient_checkpointing and hasattr(self.llm, "gradient_checkpointing_enable"):
+            self.llm.gradient_checkpointing_enable()
+        if use_qlora:
+            require_kbit_support()
+            self.llm = prepare_model_for_kbit_training(
+                self.llm,
+                use_gradient_checkpointing=gradient_checkpointing,
+            )
         self.vision_encoder = None
         if vision_model_name is not None:
             self.vision_encoder = AutoModel.from_pretrained(
                 vision_model_name,
                 torch_dtype=dtype,
+                trust_remote_code=trust_remote_code,
             )
             if freeze_vision:
                 freeze_module(self.vision_encoder)
@@ -160,6 +204,11 @@ class ServerQFormerLLM(nn.Module):
             dropout=qformer_dropout,
             use_visual_tokens=vision_model_name is not None,
         )
+        self.uses_kbit = bool(use_qlora)
+        if self.uses_kbit and runtime_device is not None:
+            self.connector.to(runtime_device)
+            if self.vision_encoder is not None:
+                self.vision_encoder.to(runtime_device)
 
     def encode_images(self, pixel_values):
         if self.vision_encoder is None or pixel_values is None:
@@ -201,3 +250,14 @@ class ServerQFormerLLM(nn.Module):
             labels=labels,
             return_dict=True,
         )
+
+    def load_connector_checkpoint(self, checkpoint_path):
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        if any(key.startswith("connector.") for key in state_dict):
+            state_dict = {
+                key[len("connector.") :]: value
+                for key, value in state_dict.items()
+                if key.startswith("connector.")
+            }
+        missing, unexpected = self.connector.load_state_dict(state_dict, strict=False)
+        return {"missing_keys": missing, "unexpected_keys": unexpected}
