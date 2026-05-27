@@ -121,6 +121,29 @@ def resolve_path(path_value):
     return str(Path(path_value).expanduser().resolve())
 
 
+def maybe_make_relative(value, base_dir):
+    if not isinstance(value, str):
+        return value
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        return value
+    try:
+        return path.resolve().relative_to(base_dir).as_posix()
+    except ValueError:
+        return value
+
+
+def relativize_payload(payload, base_dir):
+    if isinstance(payload, dict):
+        return {
+            key: relativize_payload(value, base_dir)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [relativize_payload(value, base_dir) for value in payload]
+    return maybe_make_relative(payload, base_dir)
+
+
 def normalize_label_name(name):
     return str(name).strip().lower().replace(" ", "_")
 
@@ -1181,9 +1204,10 @@ def main():
         flat_samples.extend(sample_flat_rows)
         enriched_manifest.append(manifest_row)
 
-    save_json(output_path, samples)
-    save_jsonl(flat_output, flat_samples)
-    save_jsonl(manifest_output, enriched_manifest)
+    path_base = Path.cwd().resolve()
+    save_json(output_path, relativize_payload(samples, path_base))
+    save_jsonl(flat_output, relativize_payload(flat_samples, path_base))
+    save_jsonl(manifest_output, relativize_payload(enriched_manifest, path_base))
     print(
         f"Saved {len(samples)} ShareGPT samples, "
         f"{len(flat_samples)} flat QA rows, "

@@ -183,6 +183,29 @@ def write_jsonl(path, rows):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def maybe_make_relative(value, base_dir):
+    if not isinstance(value, str):
+        return value
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        return value
+    try:
+        return path.resolve().relative_to(base_dir).as_posix()
+    except ValueError:
+        return value
+
+
+def relativize_payload(payload, base_dir):
+    if isinstance(payload, dict):
+        return {
+            key: relativize_payload(value, base_dir)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [relativize_payload(value, base_dir) for value in payload]
+    return maybe_make_relative(payload, base_dir)
+
+
 def main():
     args = parse_args()
     if not torch.cuda.is_available():
@@ -309,7 +332,7 @@ def main():
                         "checkpoint": args.checkpoint,
                     },
                 }
-                manifest_rows.append(row)
+                manifest_rows.append(relativize_payload(row, Path.cwd().resolve()))
                 exported += 1
                 if args.max_samples is not None and exported >= args.max_samples:
                     break
