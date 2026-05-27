@@ -30,12 +30,12 @@ def parse_args():
     parser.add_argument(
         "--manifest",
         default=None,
-        help="override enriched manifest path; defaults to <root>/bev_vlm_sharegpt_v2_manifest.jsonl",
+        help="override enriched manifest path; defaults to <root>/bev_vlm_task_conditioned_manifest.jsonl",
     )
     parser.add_argument(
         "--flat",
         default=None,
-        help="override flat jsonl path; defaults to <root>/bev_vlm_sharegpt_v2_flat.jsonl",
+        help="override flat jsonl path; defaults to <root>/bev_vlm_task_conditioned_flat.jsonl",
     )
     return parser.parse_args()
 
@@ -89,8 +89,8 @@ def validate_flat_rows(rows):
 def main():
     args = parse_args()
     root = Path(args.root).resolve()
-    manifest_path = Path(args.manifest).resolve() if args.manifest else root / "bev_vlm_sharegpt_v2_manifest.jsonl"
-    flat_path = Path(args.flat).resolve() if args.flat else root / "bev_vlm_sharegpt_v2_flat.jsonl"
+    manifest_path = Path(args.manifest).resolve() if args.manifest else root / "bev_vlm_task_conditioned_manifest.jsonl"
+    flat_path = Path(args.flat).resolve() if args.flat else root / "bev_vlm_task_conditioned_flat.jsonl"
 
     manifest_rows = load_jsonl(manifest_path)
     flat_rows = load_jsonl(flat_path)
